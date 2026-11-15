@@ -4,7 +4,8 @@ Lives next to nablamimic and reuses its robot model and reference conventions, s
 benchmark's own G1, timestep and contact set. Nothing here imports JAX: the diagnostics run on CPU MuJoCo.
 
 Implemented so far:
-  exp0   reference feasibility diagnostics (python -m aasaan.exp0 --help)
+  exp0    reference feasibility diagnostics (python -m aasaan.exp0 --help)
+  teach   feedforward from inverse dynamics and the iLQR teacher, with gates 1 and 2 (python -m aasaan.teach --help)
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"

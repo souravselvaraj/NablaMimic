@@ -11,7 +11,7 @@ unactuated base for the reference to be a real motion, in units of body weight:
 
 | residual | contact forces | what a large value means |
 |---|---|---|
-| `r_soft` | MuJoCo's soft contact, evaluated on the reference as given | what a positions-only projection must remove |
+| `r_soft` | MuJoCo's soft contact, evaluated on the reference as given | mostly that the feet are a fraction of a millimetre off |
 | `r_cone` | the best forces any friction pyramid allows at points within 2 cm of the floor | the motion itself breaks Newton–Euler |
 
 ```bash
@@ -50,12 +50,57 @@ On CPU MuJoCo 3.17 with the benchmark model (`tests/test_aasaan_exp0.py`):
 - **The default smoothing is a guess.** It has only seen noise-free simulated frames, where less smoothing is
   better. Real retargeted clips carry noise; `sweep` is how the right amount gets chosen.
 
-Consequence for the projection stage: through MuJoCo's contact model as it stands, the base residual has no gradient
-while a foot is above the floor and a slope of four to twelve body weights per millimetre once it is below. The
-projection needs a relaxed contact model that is tightened as it converges, or explicit contact-force variables.
+## Stages 1 and 2: the teacher
+
+```bash
+python -m aasaan.teach --clips <clip names> --start 5 --seconds 8 --out runs/teacher     # CPU; gates 1 and 2
+```
+
+**The plan changed here, on evidence.** Stage 1 was going to be a positions-only projection: optimize the motion
+itself until MuJoCo's inverse dynamics leaves no force on the base. Through the benchmark's contact model that
+problem cannot be descended: the base residual has no gradient while a foot is above the floor, a slope of four to
+twelve body weights per millimetre once it is below, and friction forces that react to millimetres per second of
+slip. A sparse Levenberg–Marquardt projection (colored finite-difference Jacobian, direct solves), started from a
+reference whose feet had already been seated to carry the right vertical load, stalled at a median residual of
+0.6 body weights.
+
+What works instead (`teacher.py`):
+
+1. **Feedforward from inverse dynamics with free contact forces.** Joint torques are read off inverse dynamics with
+   the ground allowed any force inside the friction pyramids near the floor, choosing the set with the smallest
+   joint torques. Inverting the PD law gives one setpoint per 20 ms control period.
+2. **Iterative LQR in the simulator.** Linearize the 50 Hz map with MuJoCo's finite differences, run Riccati
+   backward, roll forward in the real simulator, repeat along the rollout. The nominal that comes out is a rollout,
+   so it is feasible by construction, and the same pass yields the gains `K` and the cost-to-go `P`.
+
+Measured (`tests/test_aasaan_teacher.py`, CPU):
+
+| reference | gate 1: one-period defect | open loop | teacher, closed loop |
+|---|---|---|---|
+| 0.8 s the simulator produced | root 0.007 mm, joints 1 mrad | 0.17 mm off after 0.4 s | not run |
+| 2.4 s kinematic squat, never simulated | root 0.6 mm, joints 20 mrad (the ankles seating soles that are flat only to 1 mm) | falls at 2.2 s | stays within 1.0 mm and 1.8 mrad at the root |
+
+Pushes on the squat teacher (impulse on the torso over 0.1 s):
+
+| impulse | forward | backward | sideways | peak cost-to-go |
+|---|---|---|---|---|
+| 5 N s | recovers | recovers | recovers | under 400 |
+| 10 N s | stays up, 116 mm off at the end | falls | recovers | 320 to 1e5 |
+| 20 N s, 40 N s | falls | falls | falls | above 2.7e4 |
+
+So linear feedback around a planted-feet reference absorbs roughly 5 to 10 N s. That is far below the 40 N s used
+to test learned trackers, which recover by stepping; nothing here can choose a new foothold. Whether walking and
+running references give wider tubes is the first thing to check on real clips. The cost-to-go separates the
+recovered pushes from the falls by two orders of magnitude, which is what the value-triggered stage needs.
+
+Cost: about 2.3 CPU-seconds per second of motion per backward pass, three passes by default.
+
+The LQR weights in `teacher.TOL` are provisional tolerances, not yet the quadratic expansion of the benchmark reward.
 
 ## Not yet run
 
-- Anything on real LAFAN1 clips: the machine this was written on cannot reach Hugging Face.
+- Anything on real LAFAN1 clips: the machine this was written on cannot reach Hugging Face. Both the smoothing
+  default and every teacher number above are from simulated or synthetic motion.
 - `dump_tracking.py` (needs JAX and a GPU).
-- `test_model_matches_benchmark` (skipped without JAX).
+- `test_model_matches_benchmark` was skipped here for lack of JAX.
+- The observation-only (LQG) teacher, distillation into the policy, and value-triggered correction do not exist yet.
