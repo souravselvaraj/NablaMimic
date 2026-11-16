@@ -188,7 +188,7 @@ def test_cli_run_and_join(sim, tmp_path, capsys):
         w.writerow(["clip", "frame", "error"])
         for r in wins:
             for fr in range(int(r["frame0"]), int(r["frame1"])):
-                w.writerow([r["clip"], fr, 0.01 + float(r["r_cone_max"])])
+                w.writerow([r["clip"], fr, 0.01 + float(r["r_cone_mean"])])
     capsys.readouterr()
     exp0.main(["join", "--exp0", str(out), "--tracking", str(track)])
     text = capsys.readouterr().out

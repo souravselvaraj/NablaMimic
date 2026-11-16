@@ -8,4 +8,4 @@ Implemented so far:
   teach   feedforward from inverse dynamics and the iLQR teacher, with gates 1 and 2 (python -m aasaan.teach --help)
 """
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"

@@ -24,7 +24,7 @@ import numpy as np
 
 from .feasibility import Analyzer, summarize, windows
 from .model import ROOT
-from .reference import EPS_DEFAULT, build_reference, load_csv
+from .reference import EPS_DEFAULT, load_reference
 
 _AN = None  # one Analyzer per worker process
 
@@ -39,11 +39,11 @@ def _eps(args):
 
 def _one(job):
     global _AN
-    path, eps, kind, tol, length, frames_dir = job
+    path, eps, kind, tol, length, frames_dir, refs = job
     if _AN is None or (_AN.tol, _AN.length) != (tol, length):
         _AN = Analyzer(tol=tol, length=length)
     t0 = time.time()
-    ref = build_reference(_AN.m, load_csv(path), Path(path).stem, eps, kind)
+    ref = load_reference(_AN.m, path, eps, kind, refs)
     diag = _AN.analyze(ref)
     if frames_dir is not None:
         np.savez_compressed(Path(frames_dir) / f"{ref.name}.npz", h=ref.h, z_shift=ref.z_shift,
@@ -78,7 +78,7 @@ def run(args):
     paths = _clips(args)
     out = Path(args.out)
     (out / "frames").mkdir(parents=True, exist_ok=True)
-    jobs = [(str(p), _eps(args), args.kind, args.tol, args.length, str(out / "frames")) for p in paths]
+    jobs = [(str(p), _eps(args), args.kind, args.tol, args.length, str(out / "frames"), args.refs) for p in paths]
     workers = max(1, min(args.workers, len(jobs)))
     t0 = time.time()
     if workers == 1:
@@ -102,7 +102,8 @@ def _print_table(rows, cols):
     width = max(len(str(r[cols[0]])) for r in rows)
     print(f"{cols[0]:<{width}}  " + "  ".join(f"{c:>18}" for c in cols[1:]))
     for r in rows:
-        print(f"{str(r[cols[0]]):<{width}}  " + "  ".join(f"{r[c]:>18.4g}" for c in cols[1:]))
+        print(f"{str(r[cols[0]]):<{width}}  " + "  ".join(
+            f"{r[c]:>18}" if isinstance(r[c], str) else f"{r[c]:>18.4g}" for c in cols[1:]))
 
 
 def sweep(args):
@@ -114,11 +115,11 @@ def sweep(args):
     for s in scales:
         eps = {k: v * s for k, v in _eps(args).items()}
         for p in paths:
-            row, _ = _one((str(p), eps, "spline", args.tol, args.length, None))
+            row, _ = _one((str(p), eps, "spline", args.tol, args.length, None, args.refs))
             rows.append({"clip": row["clip"], "eps_scale": s, **{k: row[k] for k in (
                 "r_soft_p50", "r_soft_p95", "r_cone_p50", "r_cone_p95", "r_cone_max", "acc_p99", "fit_rms_joint")}})
     for p in paths:  # the benchmark's own straight-line resampling, as the reference point
-        row, _ = _one((str(p), _eps(args), "linear", args.tol, args.length, None))
+        row, _ = _one((str(p), _eps(args), "linear", args.tol, args.length, None, args.refs))
         rows.append({"clip": row["clip"], "eps_scale": float("nan"), **{k: row[k] for k in (
             "r_soft_p50", "r_soft_p95", "r_cone_p50", "r_cone_p95", "r_cone_max", "acc_p99", "fit_rms_joint")}})
     print("eps_scale nan = straight-line resampling (the benchmark's 50 Hz reference construction)")
@@ -201,6 +202,7 @@ def main(argv=None):
         p.add_argument("--eps-joint", type=float, default=EPS_DEFAULT["joint"], help="... joint angles (rad)")
         p.add_argument("--tol", type=float, default=0.02, help="height (m) under which a point may carry floor force")
         p.add_argument("--length", type=float, default=0.75, help="length L (m) that scales torques: m*g*L")
+        p.add_argument("--refs", default=None, help="directory that keeps the smoothed references between runs")
 
     p = sub.add_parser("run", help="residuals of every clip")
     common(p)
@@ -219,7 +221,7 @@ def main(argv=None):
     p = sub.add_parser("join", help="relate window residuals to tracking error")
     p.add_argument("--exp0", required=True, help="--out directory of a run")
     p.add_argument("--tracking", required=True, help="CSV with columns clip, frame, error")
-    p.add_argument("--residual", default="r_cone_max",
+    p.add_argument("--residual", default="r_cone_mean",
                    choices=["r_cone_max", "r_cone_mean", "r_soft_max", "r_soft_mean"])
     p.add_argument("--spike-percentile", type=float, default=95.0)
     p.set_defaults(fn=join)

@@ -12,7 +12,10 @@ with zero residual (tests/test_aasaan_exp0.py):
     a[t] = (v[t+1] - v[t]) / h
 """
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -138,3 +141,28 @@ def build_reference(m, raw_wxyz, name="clip", eps=None, kind="spline", floor_ali
     qpos[:, 2] -= z
     qvel, qacc = kinematics(m, qpos, h)
     return Reference(name, h, qpos, qvel, qacc, z, fit)
+
+
+def load_reference(m, path, eps=None, kind="spline", cache=None):
+    """build_reference for one CSV. With `cache` (a directory) the smoothed positions are stored there once per
+    clip and smoothing setting and read back afterwards: fitting the splines of a full clip takes about an hour of
+    CPU, everything after it seconds. The cache holds motion data, so it belongs with the dataset, never in git."""
+    path = Path(path)
+    eps = {**EPS_DEFAULT, **(eps or {})}
+    raw = load_csv(path)
+    if cache is None:
+        return build_reference(m, raw, path.stem, eps, kind)
+    tag = kind if kind == "linear" else "spline_" + "_".join(f"{eps[k]:g}" for k in ("pos", "quat", "joint"))
+    f = Path(cache) / f"{path.stem}__{tag}.npz"
+    h = float(m.opt.timestep)
+    if f.exists():
+        z = np.load(f)
+        if int(z["frames"]) == len(raw) and float(z["h"]) == h:
+            qvel, qacc = kinematics(m, z["qpos"], h)
+            return Reference(path.stem, h, z["qpos"], qvel, qacc, float(z["z_shift"]), json.loads(str(z["fit_rms"])))
+    ref = build_reference(m, raw, path.stem, eps, kind)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name(f"{f.stem}.{os.getpid()}.tmp.npz")  # written whole, then renamed: workers may race
+    np.savez(tmp, qpos=ref.qpos, z_shift=ref.z_shift, fit_rms=json.dumps(ref.fit_rms), frames=len(raw), h=h)
+    os.replace(tmp, f)
+    return ref

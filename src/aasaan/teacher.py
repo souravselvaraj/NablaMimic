@@ -13,8 +13,15 @@ replayed in the simulator, follows the same reference to about a millimetre. See
 
 Stage 2, feedback. Iterative LQR in the benchmark simulator itself. The 50 Hz map x[k+1] = F(x[k], u[k]) (four
 physics steps, PD actuators, contacts) is linearized with MuJoCo's finite differences, a backward Riccati pass gives
-gains and the quadratic cost-to-go, and a forward pass plays them in the simulator. The first pass linearizes along
-the reference; later passes linearize along the previous rollout, which is a real trajectory with its feet seated.
+gains and the quadratic cost-to-go, and a forward pass plays them in the simulator.
+
+The first pass cannot linearize along the reference as given. In retargeted clips the feet sit a millimetre above
+or below the floor in most frames; one millimetre above is no contact at all to the simulator, so the linearization
+describes a robot in free fall and its gains throw the robot over (measured on a squat raised by 1 mm). seat() moves
+each reference state vertically until the simulator's contact carries the vertical load the motion needs, and the
+first pass linearizes along those states. If that pass falls, bootstrap() tries a rollout whose gains come from
+linearizing at the state the simulator is actually in. Later passes are ordinary iLQR along the previous rollout.
+
 The result is a nominal trajectory that came out of the simulator (feasible by construction) with the teacher
 
     u = u_nom[k] - K[k] dx,      dx = (q - q_nom[k], v - v_nom[k]) in tangent coordinates
@@ -132,11 +139,50 @@ def _sizes(dx, nv):
     return (np.abs(dx[:3]).max(), np.abs(dx[3:6]).max(), np.abs(dx[6:nv]).max(), np.abs(dx[nv:]).max())
 
 
-def one_period_defect(sim, ref, ff):
+def seat(an, ref, reach=0.03, iters=18):
+    """Reference positions at the control steps, each moved vertically until the simulator's own contact model
+    carries the vertical load the motion needs at that instant; where the motion needs none, lifted just clear of
+    the floor. Joint angles, orientation and horizontal position are untouched. States with nothing within `reach`
+    of the floor are left alone. Returns (qpos (K, nq), shift (K,) in metres, negative = lowered).
+
+    an: feasibility.Analyzer (its discrete inverse dynamics gives the contact force of a state directly)."""
+    Q, V = control_states(ref)
+    A = ref.qacc[::SUBSTEPS]
+    d, df = an.d, an.d_free
+    out, shift = Q.copy(), np.zeros(len(Q))
+
+    def support(q, k, dz):
+        d.qpos[:], d.qvel[:], d.qacc[:] = q, V[k], A[k]
+        d.qpos[2] += dz
+        mujoco.mj_inverse(an.m, d)
+        return d.qfrc_constraint[2]
+
+    for k in range(1, len(Q)):
+        df.qpos[:], df.qvel[:], df.qacc[:] = Q[k], V[k], A[k]
+        mujoco.mj_inverse(an.m_free, df)
+        need = df.qfrc_inverse[2]
+        if need < 0.05 * an.mg:  # flight: only make sure nothing is pressed into the floor
+            if support(Q[k], k, 0.0) <= 1e-3 * an.mg:
+                continue
+            need = 1e-3 * an.mg
+        lo, hi = -reach, reach  # support falls from large to zero as the state is raised
+        if support(Q[k], k, lo) < need:
+            continue
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if support(Q[k], k, mid) > need else (lo, mid)
+        shift[k] = 0.5 * (lo + hi)
+        out[k, 2] += shift[k]
+    return out, shift
+
+
+def one_period_defect(sim, ref, ff, qpos=None):
     """Gate 1. From each reference state, apply that period's setpoint for one control period in the real simulator
     and measure how far the result is from the next reference state. Rows: root m, root rad, joint rad, velocity
-    (largest components) for control steps 1 .. K - 2."""
+    (largest components) for control steps 1 .. K - 2. qpos: seated positions (seat) to start from and compare
+    with, so the gate measures the feedforward and not the height of the feet."""
     Q, V = control_states(ref)
+    Q = Q if qpos is None else qpos
     rows = []
     for k in range(1, min(len(ff.u), len(Q) - 1)):
         q1, v1 = sim.step(Q[k], V[k], ff.u[k])
@@ -171,8 +217,10 @@ class Teacher:
     K: np.ndarray       # (N, nu, 2 nv)
     P: np.ndarray       # (N + 1, 2 nv, 2 nv)
     k0: int
-    feasible: bool      # True once q, v, u came out of the simulator (after at least one forward pass)
-    cost: list          # tracking cost of the nominal after each pass
+    feasible: bool      # True if q, v, u are a simulator rollout that reached the end of the window
+    cost: list          # tracking cost of the nominal after the bootstrap and after each accepted pass
+    fell: int = -1      # control step at which the bootstrap tripped the termination test (then q, v, u stop there)
+    start: str = ""     # which first pass gave the first real trajectory: "seated" or "bootstrap"
 
     def action(self, sim, i, q, v):
         """The teacher's setpoint at step k0 + i in state (q, v), with the state error it acted on."""
@@ -229,9 +277,11 @@ def rollout(sim, ref, teacher, push=None, ff=None, tol=None, step=None, alpha=1.
     return Rollout(np.array(qs), np.array(vs), np.array(us), np.array(errs), np.array(vals), fell, float(cost))
 
 
-def open_loop(ref, ff, k0=1, k1=None):
-    """The feedforward alone as a Teacher with zero gains, along the reference states (not a real trajectory)."""
+def open_loop(ref, ff, k0=1, k1=None, qpos=None):
+    """The feedforward alone as a Teacher with zero gains, along the reference states or their seated positions
+    (not a real trajectory either way)."""
     Q, V = control_states(ref)
+    Q = Q if qpos is None else qpos
     k1 = min(len(ff.u), len(Q) - 1) if k1 is None else k1
     N, n = k1 - k0, 2 * V.shape[1]
     return Teacher(Q[k0:k1 + 1].copy(), V[k0:k1 + 1].copy(), ff.u[k0:k1].copy(), np.zeros((N, ff.u.shape[1], n)),
@@ -262,28 +312,85 @@ def _backward(sim, ref, ff, nom, tol, terminal=10.0):
     return step, K, P
 
 
-def ilqr(sim, ref, ff, k0=1, k1=None, passes=2, tol=None, alphas=(1.0, 0.5, 0.25, 0.1), verbose=False):
-    """Stage 2. passes Riccati-plus-rollout passes starting from the feedforward along the reference; each forward
-    pass is kept only if it lowers the tracking cost in the simulator (or is the first real trajectory)."""
-    nom = open_loop(ref, ff, k0, k1)
-    stale = True  # the gains were linearized along an earlier nominal
+def _frozen_gain(A, B, Qc, R, horizon, terminal=10.0):
+    """LQR gain for one linearization held over `horizon` control steps."""
+    P = terminal * Qc
+    for _ in range(horizon):
+        BtP = B.T @ P
+        K = np.linalg.solve(R + BtP @ B, BtP @ A)
+        Acl = A - B @ K
+        P = Qc + K.T @ R @ K + Acl.T @ P @ Acl
+    return K
+
+
+def bootstrap(sim, ref, ff, k0=1, k1=None, horizon=25, tol=None):
+    """A first real trajectory near the reference: the feedforward plus feedback on the error against the
+    reference, with gains recomputed every step from a linearization at the simulator's current state (so they
+    know which contacts are really closed). Returns a Teacher whose nominal is that rollout; P is not set."""
+    Qr, Vr = control_states(ref)
+    Qc, R = weights(sim.nv, sim.nu, tol)
+    k1 = min(len(ff.u), len(Qr) - 1) if k1 is None else k1
+    q, v = Qr[k0].copy(), Vr[k0].copy()
+    qs, vs, us, Ks, fell = [q], [v], [], [], -1
+    for k in range(k0, k1):
+        A, B = sim.linearize(q, v, ff.u[k])
+        K = _frozen_gain(A, B, Qc, R, horizon)
+        u = np.clip(ff.u[k] - K @ sim.error(Qr[k], Vr[k], q, v), sim.lo, sim.hi)
+        q, v = sim.step(q, v, u)
+        qs.append(q), vs.append(v), us.append(u), Ks.append(K)
+        if _terminated(q, Qr[k + 1]):
+            fell = k + 1
+            break
+    n = 2 * sim.nv
+    nom = Teacher(np.array(qs), np.array(vs), np.array(us), np.array(Ks), np.zeros((len(us) + 1, n, n)), k0,
+                  fell < 0, [], fell, "bootstrap")
+    if nom.feasible:
+        nom.cost.append(rollout(sim, ref, nom, ff=ff, tol=tol).cost)
+    return nom
+
+
+def _forward(sim, ref, ff, cand, step, tol, alphas, below=np.inf):
+    """Line search of one forward pass: the first step size whose cost is under `below`, else the best seen."""
+    best = None
+    for a in alphas:
+        r = rollout(sim, ref, cand, ff=ff, tol=tol, step=step, alpha=a)
+        if best is None or r.cost < best.cost:
+            best = r
+        if r.cost < below:
+            break
+    return best
+
+
+def ilqr(sim, ref, ff, qpos=None, k0=1, k1=None, passes=1, tol=None, alphas=(1.0, 0.5, 0.25, 0.1), horizon=25,
+         verbose=False):
+    """Stage 2. qpos: seated control-step positions (seat) to linearize the first pass along; without them the
+    reference itself is used, which only works if its feet are in contact. `passes` further Riccati-plus-rollout
+    passes follow along the previous rollout, each kept only if it lowers the tracking cost in the simulator. If no
+    first trajectory survives, the returned Teacher is not feasible and holds the bootstrap rollout up to its fall."""
+    say = print if verbose else (lambda *a: None)
+    nom = open_loop(ref, ff, k0, k1, qpos)
+    step, K, P = _backward(sim, ref, ff, nom, tol)
+    r = _forward(sim, ref, ff, Teacher(nom.q, nom.v, nom.u, K, P, nom.k0, False, []), step, tol, alphas)
+    if np.isfinite(r.cost):
+        say(f"  first pass: cost {r.cost:.4g}")
+        nom = Teacher(r.q, r.v, r.u, K, P, nom.k0, True, [r.cost], -1, "seated")
+    else:
+        say(f"  first pass fell at step {r.fell}; trying the bootstrap")
+        nom = bootstrap(sim, ref, ff, k0, k1, horizon, tol)
+        say("  bootstrap: " + (f"cost {nom.cost[0]:.4g}" if nom.feasible else f"fell at step {nom.fell}"))
+        if not nom.feasible:
+            return nom
+    stale = True  # K and P do not yet belong to this nominal
     for it in range(passes):
         step, K, P = _backward(sim, ref, ff, nom, tol)
-        cand = Teacher(nom.q, nom.v, nom.u, K, P, nom.k0, nom.feasible, nom.cost)
-        best = None
-        for a in alphas:
-            r = rollout(sim, ref, cand, ff=ff, tol=tol, step=step, alpha=a)
-            if best is None or r.cost < best.cost:
-                best = r
-            if np.isfinite(r.cost) and (not nom.feasible or r.cost < nom.cost[-1]):
-                break
-        if verbose:
-            print(f"  pass {it}: cost {best.cost:.4g}" + ("" if best.fell < 0 else f" (fell at step {best.fell})"))
-        if not np.isfinite(best.cost) or (nom.feasible and best.cost >= nom.cost[-1]):
-            nom, stale = cand, False  # keep the previous nominal, with gains linearized along it
+        cand = Teacher(nom.q, nom.v, nom.u, K, P, nom.k0, True, nom.cost, -1, nom.start)
+        r = _forward(sim, ref, ff, cand, step, tol, alphas, nom.cost[-1])
+        say(f"  pass {it + 1}: cost {r.cost:.4g}" + ("" if r.fell < 0 else f" (fell at step {r.fell})"))
+        if r.cost >= nom.cost[-1]:
+            nom, stale = cand, False  # keep the nominal, with gains and cost-to-go linearized along it
             break
-        nom = Teacher(best.q, best.v, best.u, K, P, nom.k0, True, nom.cost + [best.cost])
-    if nom.feasible and stale:
+        nom = Teacher(r.q, r.v, r.u, K, P, nom.k0, True, nom.cost + [r.cost], -1, nom.start)
+    if stale:
         _, K, P = _backward(sim, ref, ff, nom, tol)
-        nom = Teacher(nom.q, nom.v, nom.u, K, P, nom.k0, True, nom.cost)
+        nom = Teacher(nom.q, nom.v, nom.u, K, P, nom.k0, True, nom.cost, -1, nom.start)
     return nom

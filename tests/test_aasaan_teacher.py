@@ -11,9 +11,10 @@ import pytest
 from aasaan import teach
 from aasaan.feasibility import Analyzer
 from aasaan.model import SUBSTEPS, build_model, scene_path
-from aasaan.reference import Reference, kinematics, to_csv_rows
+from aasaan.reference import Reference, kinematics, load_reference, to_csv_rows
 from aasaan.synthetic import squat
-from aasaan.teacher import Simulator, control_states, feedforward, ilqr, one_period_defect, open_loop, rollout
+from aasaan.teacher import (Simulator, control_states, feedforward, ilqr, one_period_defect, open_loop, rollout,
+                            seat)
 
 pytestmark = pytest.mark.skipif(not scene_path().exists(), reason="Menagerie G1 missing (scripts/setup_menagerie.sh)")
 
@@ -51,7 +52,7 @@ def simulated():
 def squat_case(an, sim):
     ref = squat(an.m, seconds=2.4)
     ff = feedforward(an, ref)
-    return ref, ff, ilqr(sim, ref, ff, passes=2)
+    return ref, ff, ilqr(sim, ref, ff, passes=1)
 
 
 def test_feedforward_replays_a_simulated_motion(an, sim, simulated):
@@ -86,8 +87,8 @@ def test_linearization_predicts_the_simulator(an, sim):
 
 
 def test_teacher_turns_a_kinematic_squat_into_a_trajectory(an, sim, squat_case):
-    """The feedforward alone drifts away; the iLQR nominal is a real rollout that stays on the reference, and each
-    pass lowered the tracking cost."""
+    """The feedforward alone drifts away; the iLQR nominal is a real rollout that stays on the reference, and the
+    second pass lowered the tracking cost."""
     ref, ff, teacher = squat_case
     ol = rollout(sim, ref, open_loop(ref, ff), ff=ff)
     cl = rollout(sim, ref, teacher, ff=ff)
@@ -115,17 +116,74 @@ def test_teacher_recovers_from_a_small_push_and_its_value_sees_a_large_one(sim, 
     assert peaks["large"] > 20 * max(peaks["small_fwd"], peaks["small_side"])
 
 
+def _moved(an, ref, name, dz, wobble=0.0, seed=0):
+    """The reference with its root raised by dz and, with wobble, the root height and ankle angles drifting by
+    that many metres / 3.3 x that many radians at a few hertz: feet that are off the floor the way retargeted
+    clips' are."""
+    Q = ref.qpos.copy()
+    Q[:, 2] += dz
+    if wobble:
+        rng = np.random.default_rng(seed)
+        t = np.arange(len(Q)) * ref.h
+
+        def drift(amp):
+            return amp * sum(np.sin(2 * np.pi * f * t + rng.uniform(0, 6.28)) for f in (2.1, 3.0, 4.8)) / 2
+
+        Q[:, 2] += drift(wobble)
+        for i in range(an.m.nu):
+            if "ankle" in an.m.joint(an.m.actuator_trnid[i, 0]).name:
+                Q[:, 7 + i] += drift(3.3 * wobble)
+    qvel, qacc = kinematics(an.m, Q, ref.h)
+    return Reference(name, ref.h, Q, qvel, qacc, 0.0, {})
+
+
+def test_feet_a_few_millimetres_off_the_floor_need_seating(an, sim):
+    """Raised by 3 mm the reference never touches the floor as far as the simulator can tell. Seating finds the
+    3 mm, gate 1 from seated states measures the feedforward again, and the teacher holds the clip at the height
+    the floor allows."""
+    ref = _moved(an, squat(an.m, seconds=2.0), "raised", 0.003)
+    ff = feedforward(an, ref)
+    qpos, shift = seat(an, ref)
+    assert np.all(shift[1:] < -0.0029) and np.all(shift[1:] > -0.0036)
+    raw, seated = one_period_defect(sim, ref, ff), one_period_defect(sim, ref, ff, qpos)
+    assert np.median(raw[:, 0]) > 1.5e-3 and np.median(seated[:, 0]) < 1e-3
+    teacher = ilqr(sim, ref, ff, qpos, passes=0)
+    cl = rollout(sim, ref, teacher, ff=ff)
+    assert teacher.feasible and teacher.start == "seated" and cl.fell < 0
+    assert cl.err[:, 0].max() < 6e-3                                 # 3 mm of it is the floor
+
+
+def test_teacher_survives_feet_that_wobble_about_the_floor(an, sim):
+    """Root height and ankles drifting by +-3 mm and +-10 mrad around a 2 mm hover. Whichever first pass it takes,
+    a real trajectory comes out and stays near the reference."""
+    ref = _moved(an, squat(an.m, seconds=2.0), "wobble", 0.002, wobble=0.003)
+    ff = feedforward(an, ref)
+    qpos, shift = seat(an, ref)
+    assert np.ptp(shift[1:]) > 0.003
+    teacher = ilqr(sim, ref, ff, qpos, passes=1)
+    cl = rollout(sim, ref, teacher, ff=ff)
+    assert teacher.feasible and teacher.start in ("seated", "bootstrap") and cl.fell < 0
+    assert cl.err[:, 0].max() < 0.015 and cl.err[:, 1].max() < 0.05
+
+
 def test_cli_reports_the_gates(an, tmp_path, capsys):
-    """teach on a CSV in the dataset's layout: the squat sent through 30 FPS frames."""
+    """teach on a CSV in the dataset's layout: the squat sent through 30 FPS frames. The smoothed reference is kept
+    on disk and comes back bit for bit."""
     ref = squat(an.m, seconds=2.5)
     t = np.arange(0.0, (len(ref.qpos) - 1) * ref.h, 1.0 / 30.0)
     raw = ref.qpos[np.round(t / ref.h).astype(int)]
-    data, out = tmp_path / "data", tmp_path / "out"
+    data, out, refs = tmp_path / "data", tmp_path / "out", tmp_path / "refs"
     data.mkdir()
     np.savetxt(data / "squat.csv", to_csv_rows(raw), delimiter=",")
-    teach.main(["--data", str(data), "--out", str(out), "--start", "0.2", "--seconds", "1.6", "--passes", "1",
-                "--impulses", "5", "--workers", "1"])
+    teach.main(["--data", str(data), "--out", str(out), "--refs", str(refs), "--start", "0.2", "--seconds", "1.6",
+                "--passes", "1", "--impulses", "5", "--workers", "1"])
     text = capsys.readouterr().out
-    assert "squat" in text and "pushes survived" in text
+    assert "squat" in text and "pushes survived" in text and ("seated" in text or "bootstrap" in text)
     z = np.load(out / "squat.npz")
     assert z["K"].shape[1:] == (29, 70) and z["q"].shape[0] == z["u"].shape[0] + 1
+    kept = list(refs.glob("squat__spline_*.npz"))
+    assert len(kept) == 1
+    first = load_reference(an.m, data / "squat.csv", cache=refs)
+    fresh = load_reference(an.m, data / "squat.csv")
+    assert np.array_equal(first.qpos, fresh.qpos) and np.array_equal(first.qacc, fresh.qacc)
+    assert first.z_shift == fresh.z_shift and first.fit_rms == fresh.fit_rms
