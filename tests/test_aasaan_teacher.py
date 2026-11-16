@@ -8,13 +8,13 @@ import mujoco
 import numpy as np
 import pytest
 
-from aasaan import teach
-from aasaan.feasibility import Analyzer
+from aasaan import hold, teach
+from aasaan.feasibility import Analyzer, stance_quality
 from aasaan.model import SUBSTEPS, build_model, scene_path
 from aasaan.reference import Reference, kinematics, load_reference, to_csv_rows
 from aasaan.synthetic import squat
-from aasaan.teacher import (Simulator, control_states, feedforward, ilqr, one_period_defect, open_loop, rollout,
-                            seat)
+from aasaan.teacher import (ControlPath, Setpoints, Simulator, control_states, feedforward, ilqr,
+                            one_period_defect, open_loop, rollout, seat)
 
 pytestmark = pytest.mark.skipif(not scene_path().exists(), reason="Menagerie G1 missing (scripts/setup_menagerie.sh)")
 
@@ -187,3 +187,74 @@ def test_cli_reports_the_gates(an, tmp_path, capsys):
     fresh = load_reference(an.m, data / "squat.csv")
     assert np.array_equal(first.qpos, fresh.qpos) and np.array_equal(first.qacc, fresh.qacc)
     assert first.z_shift == fresh.z_shift and first.fit_rms == fresh.fit_rms
+
+
+
+def _log(seconds, kick=0.0):
+    """(qpos, qvel, ctrl) at 50 Hz of the simulator under a swaying setpoint; with kick, shoved so that it topples."""
+    m, _, _ = build_model()
+    d = mujoco.MjData(m)
+    mujoco.mj_resetDataKeyframe(m, d, m.key("knees_bent").id)
+    q0 = d.qpos[7:].copy()
+    d.qvel[0], d.qvel[5] = kick, 1.25 * kick
+    Q, V, U = [d.qpos.copy()], [d.qvel.copy()], []
+    for k in range(int(round(seconds / 0.02))):
+        d.ctrl[:] = q0 + 0.05 * np.sin(2 * np.pi * 0.7 * k * 0.02 + np.arange(m.nu))
+        U.append(d.ctrl.copy())
+        for _ in range(SUBSTEPS):
+            mujoco.mj_step(m, d)
+        Q.append(d.qpos.copy()), V.append(d.qvel.copy())
+    return np.array(Q), np.array(V), np.array(U)
+
+
+def test_stance_quality_tells_planted_feet_from_sliding_ones(an):
+    """The squat leans on points that are at the floor and at rest. Drag the same squat sideways at 10 cm/s and
+    lift it 5 mm and the points it leans on hover and slide by that much."""
+    ref = squat(an.m, seconds=1.0)
+    planted = stance_quality(an, ref)
+    assert planted["loaded_frac"] == 1.0 and abs(planted["hover_mm"]) < 1.5 and planted["slip_cm_s"] < 0.5
+    Q = ref.qpos.copy()
+    Q[:, 1] += 0.10 * np.arange(len(Q)) * ref.h
+    Q[:, 2] += 0.005
+    qvel, qacc = kinematics(an.m, Q, ref.h)
+    dragged = stance_quality(an, Reference("dragged", ref.h, Q, qvel, qacc, 0.0, {}))
+    assert dragged["slip_cm_s"] == pytest.approx(10.0, abs=0.5)
+    assert dragged["hover_mm"] == pytest.approx(planted["hover_mm"] + 5.0, abs=0.5)
+
+
+def test_hold_reads_a_log_and_catches_wrong_conventions(sim, tmp_path, capsys):
+    """A log this simulator made is reproduced exactly and held, with pushes. The same log with the quaternion
+    written x y z w, or with the angular velocity in the world frame, is reported as disagreeing with itself; with
+    the targets off by one period, as not reproduced."""
+    Q, V, U = _log(3.0, kick=0.4)  # long enough to end lying down: frames only differ once the body has turned
+    path, ff = ControlPath("log", Q, V), Setpoints(U)
+    assert max(k for k in hold.kinematic_check(sim, path) if k == k) < 0.1
+    own = one_period_defect(sim, path, ff, k0=0)[:, 0]
+    assert np.median(own) < 1e-12 and own.max() < 1e-6    # not bit for bit: each period restarts the contact solver
+    xyzw = Q.copy()
+    xyzw[:, 3:7] = xyzw[:, [4, 5, 6, 3]]
+    assert hold.kinematic_check(sim, ControlPath("xyzw", xyzw, V))[1] > 0.5
+    world, R = V.copy(), np.zeros(9)
+    for k in range(len(Q)):
+        mujoco.mju_quat2Mat(R, Q[k, 3:7])
+        world[k, 3:6] = R.reshape(3, 3) @ V[k, 3:6]
+    assert hold.kinematic_check(sim, ControlPath("world", Q, world))[1] > 0.2
+    late = one_period_defect(sim, ControlPath("late", Q[:-1], V[:-1]), Setpoints(U[1:]), k0=0)
+    assert np.median(late[:, 2]) > 2e-4
+
+    files = []
+    for name, (q, v, u) in (("sway", _log(1.0)), ("late", (Q[:-1], V[:-1], U[1:]))):
+        files.append(str(tmp_path / f"{name}.npz"))
+        np.savez(files[-1], qpos=q.astype(np.float32), qvel=v.astype(np.float32), ctrl=u.astype(np.float32))
+    hold.main(["--traj", *files, "--out", str(tmp_path / "out"), "--impulses", "5", "--workers", "1"])
+    text = capsys.readouterr().out
+    assert "WARNING late" in text and "WARNING sway" not in text
+    assert "sway: fwd:" in text and (tmp_path / "out" / "sway_teacher.npz").exists()
+    with pytest.raises(ValueError, match="expected qpos"):
+        hold.load(_bad_shape(tmp_path, Q, V, U), sim)
+
+
+def _bad_shape(tmp_path, Q, V, U):
+    f = tmp_path / "bad.npz"
+    np.savez(f, qpos=Q, qvel=V, ctrl=U[:-1])
+    return f

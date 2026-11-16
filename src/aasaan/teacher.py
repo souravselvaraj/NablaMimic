@@ -128,9 +128,26 @@ class Simulator:
         return dx
 
 
+@dataclass
+class ControlPath:
+    """States already at the control rate, for example a logged rollout: state k + 1 follows state k after one
+    20 ms period. Stands in for a Reference wherever only the control-step states are used."""
+    name: str
+    qpos: np.ndarray    # (K, nq), quaternion (w, x, y, z)
+    qvel: np.ndarray    # (K, nv)
+
+
+@dataclass
+class Setpoints:
+    """One setpoint per control step, where a Feedforward is expected but only its u is used."""
+    u: np.ndarray       # (K - 1, nu)
+
+
 def control_states(ref):
-    """Reference states at the control steps: physics samples 0, 4, 8, ... (sample 0 has no velocity; everything
-    here starts at control step 1)."""
+    """States at the control steps. For a Reference: physics samples 0, 4, 8, ... (sample 0 has no velocity, so
+    everything built on a Reference starts at control step 1)."""
+    if isinstance(ref, ControlPath):
+        return ref.qpos, ref.qvel
     return ref.qpos[::SUBSTEPS], ref.qvel[::SUBSTEPS]
 
 
@@ -176,18 +193,20 @@ def seat(an, ref, reach=0.03, iters=18):
     return out, shift
 
 
-def one_period_defect(sim, ref, ff, qpos=None):
+def one_period_defect(sim, ref, ff, qpos=None, k0=1, joints=False):
     """Gate 1. From each reference state, apply that period's setpoint for one control period in the real simulator
     and measure how far the result is from the next reference state. Rows: root m, root rad, joint rad, velocity
-    (largest components) for control steps 1 .. K - 2. qpos: seated positions (seat) to start from and compare
-    with, so the gate measures the feedforward and not the height of the feet."""
+    (largest components) for control steps k0 .. K - 2. qpos: seated positions (seat) to start from and compare
+    with, so the gate measures the feedforward and not the height of the feet. joints=True also returns the
+    position defect of every joint, (rows, nu)."""
     Q, V = control_states(ref)
     Q = Q if qpos is None else qpos
-    rows = []
-    for k in range(1, min(len(ff.u), len(Q) - 1)):
+    rows, per = [], []
+    for k in range(k0, min(len(ff.u), len(Q) - 1)):
         q1, v1 = sim.step(Q[k], V[k], ff.u[k])
-        rows.append(_sizes(sim.error(Q[k + 1], V[k + 1], q1, v1), sim.nv))
-    return np.array(rows)
+        dx = sim.error(Q[k + 1], V[k + 1], q1, v1)
+        rows.append(_sizes(dx, sim.nv)), per.append(np.abs(dx[6:sim.nv]))
+    return (np.array(rows), np.array(per)) if joints else np.array(rows)
 
 
 def weights(nv, nu, tol=None):
@@ -221,6 +240,7 @@ class Teacher:
     cost: list          # tracking cost of the nominal after the bootstrap and after each accepted pass
     fell: int = -1      # control step at which the bootstrap tripped the termination test (then q, v, u stop there)
     start: str = ""     # which first pass gave the first real trajectory: "seated" or "bootstrap"
+    seated_fell: int = -1   # control step at which the seated first pass fell, if it did
 
     def action(self, sim, i, q, v):
         """The teacher's setpoint at step k0 + i in state (q, v), with the state error it acted on."""
@@ -377,6 +397,7 @@ def ilqr(sim, ref, ff, qpos=None, k0=1, k1=None, passes=1, tol=None, alphas=(1.0
     else:
         say(f"  first pass fell at step {r.fell}; trying the bootstrap")
         nom = bootstrap(sim, ref, ff, k0, k1, horizon, tol)
+        nom.seated_fell = r.fell
         say("  bootstrap: " + (f"cost {nom.cost[0]:.4g}" if nom.feasible else f"fell at step {nom.fell}"))
         if not nom.feasible:
             return nom

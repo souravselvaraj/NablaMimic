@@ -156,3 +156,52 @@ def windows(diag, h, seconds=1.0, control_dt=0.02):
                      "flight_frac": float(diag.flight[s].mean()),
                      "tau_ratio_cone_max": float(diag.tau_ratio_cone[s].max())})
     return rows
+
+
+def _weighted(values, weights, q):
+    """Weighted quantile q in [0, 1]."""
+    order = np.argsort(values)
+    c = np.cumsum(weights[order])
+    return float(values[order][np.searchsorted(c, q * c[-1])])
+
+
+def stance_quality(an, ref, stride=4):
+    """How the reference treats the floor points it leans on. For every `stride`-th frame the best pyramid forces
+    are found as in Analyzer.frame, and each point within tol of the floor is recorded with the normal force it
+    was given, its height above the floor and its horizontal speed. All statistics are weighted by that force.
+
+    A simulator trajectory would have every loaded point at the floor (a fraction of a millimetre in) and at rest.
+    Returns hover_mm and slip_cm_s (medians), their 95th percentiles, and loaded_frac, the share of frames that
+    lean on anything."""
+    m, d, df = an.m_geo, an.d_geo, an.d_free
+    jac = np.zeros((3, m.nv))
+    height, speed, load, frames, loaded = [], [], [], 0, 0
+    for t in range(1, len(ref.qpos) - 1, stride):
+        frames += 1
+        df.qpos[:], df.qvel[:], df.qacc[:] = ref.qpos[t], ref.qvel[t], ref.qacc[t]
+        mujoco.mj_inverse(an.m_free, df)
+        A = an._candidates(ref.qpos[t])  # leaves d at this pose, contacts in the same order as the columns
+        if not A.shape[1]:
+            continue
+        lam, _ = nnls(A[:NBASE] * an.scale[:, None], df.qfrc_inverse[:NBASE] * an.scale)
+        normal = lam.reshape(-1, 4).sum(1)
+        if normal.sum() < 0.05 * an.mg:
+            continue
+        loaded += 1
+        j = 0
+        for i in range(d.ncon):
+            c = d.contact[i]
+            if an.floor not in (c.geom1, c.geom2):
+                continue
+            if normal[j] > 0:
+                geom = c.geom2 if c.geom1 == an.floor else c.geom1
+                mujoco.mj_jac(m, d, jac, None, c.pos, int(m.geom_bodyid[geom]))
+                height.append(c.dist), speed.append(np.linalg.norm((jac @ ref.qvel[t])[:2])), load.append(normal[j])
+            j += 1
+    if not load:
+        return dict(hover_mm=float("nan"), hover_mm_p95=float("nan"), slip_cm_s=float("nan"),
+                    slip_cm_s_p95=float("nan"), loaded_frac=0.0)
+    height, speed, load = np.array(height), np.array(speed), np.array(load)
+    return dict(hover_mm=_weighted(height, load, 0.5) * 1e3, hover_mm_p95=_weighted(height, load, 0.95) * 1e3,
+                slip_cm_s=_weighted(speed, load, 0.5) * 1e2, slip_cm_s_p95=_weighted(speed, load, 0.95) * 1e2,
+                loaded_frac=loaded / frames)

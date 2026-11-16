@@ -4,6 +4,10 @@ Feedback-distilled trajectory optimization for humanoid motion tracking, built n
 measured on the benchmark's own G1, timestep and contact model. Work in progress; nothing in `src/nablamimic` is
 changed.
 
+**Status: the teacher does not work on real clips.** It holds every synthetic test in this file and produced no
+feasible trajectory on any of the five LAFAN1 clips it was run on ("Real clips" below). What is left to find out
+is which half failed, and `aasaan.hold` is the experiment for that.
+
 ## Experiment 0: does reference infeasibility predict tracking difficulty?
 
 No training and no GPU. For every 200 Hz frame of every clip it asks how much force would have to act on the robot's
@@ -152,10 +156,78 @@ slides in the reference is linearized as sliding; a tilted foot is seated on its
 `teacher.TOL` are provisional tolerances (2 cm on the root, where the benchmark reward's scale is 30 cm), not yet
 the quadratic expansion of the benchmark reward.
 
+## Real clips
+
+Run on the cluster with commit `edf16ba`, default smoothing; numbers as reported from there, not reproduced here.
+
+### The baseline this has to beat
+
+∇Mimic as shipped, one RTX PRO 6000, seed 0: return 0.811 at 403 s of training and 0.832 at 503 s, so 0.82 is
+crossed at about 7.5 minutes. Final return 0.908 after 3 h, no clip failing. Its weakest reward term is root
+position, 0.66 on average: it reaches that return while letting the root wander (a constant error of about 20 cm
+would give 0.66 at the reward's 30 cm scale).
+
+### Teacher gates: all five fail
+
+8 s windows starting at 5 s.
+
+| clip | `r_cone` p95 | seating, median / max | gate 1 root | gate 1 joints | open loop | teacher |
+|---|---|---|---|---|---|---|
+| walk1_subject1 | 0.03 | 6.1 / 11.7 mm | 1.5 mm | 44 mrad | 1.1 s | fell at 1.3 s |
+| run1_subject2 | 0.09 | 4.1 / 20.3 mm | 1.6 mm | 65 mrad | 1.5 s | fell at 1.3 s |
+| jumps1_subject1 | 0.71 | 3.0 / 29.7 mm | 2.1 mm | 40 mrad | 2.0 s | fell at 1.6 s |
+| dance1_subject1 | 0.13 | 8.3 / 18.6 mm | 1.5 mm | 31 mrad | 1.0 s | fell at 1.8 s |
+| fallAndGetUp3_subject1 | 0.18 | 9.0 / 30.0 mm | 1.7 mm | 36 mrad | 0.7 s | fell at 0.7 s |
+
+Feedback bought nothing over the feedforward alone. The walk window is the telling row: by `r_cone` it is almost
+feasible (0.03 body weights) and it still cannot be held for a second and a half. So `r_cone` does not measure what the
+teacher needs. It asks whether some forces at points within 2 cm of the floor could support the motion; the
+simulator only supplies force at a sole that is on the floor, flat and not sliding. The references are far from
+that (feet 3 to 9 mm off the floor in the typical frame, up to 30 mm), and the synthetic squat that every test here
+uses has none of it: planted flat feet, no steps. The tests passed and said nothing about real motion.
+
+### Experiment 0 at clip level: no better than acceleration
+
+Over the 40 clips, against the baseline's per-clip return (Spearman):
+
+| predictor | rank correlation |
+|---|---|
+| `r_cone` p95 | -0.68 |
+| share of frames with `r_cone` above 0.1 | -0.68 |
+| share of frames with nothing near the floor | -0.60 |
+| joint acceleration p99 | -0.62 |
+| `r_soft` p95 | +0.06 |
+
+With 40 clips, -0.68 and -0.62 are not distinguishable. And the top of `r_cone` is not dynamics: 98% of the worst
+1% of frames have nothing within 2 cm of the floor while the motion needs support (median 0.72 body weights), one
+clip for 20 s on end. The simulator's contact carries nothing in 54 to 92% of frames (median clip 89%). The largest
+infeasibility in these references is where the floor is, which the benchmark's reward is built to forgive.
+
+### What decides the next step: `aasaan.hold`
+
+```bash
+python -m aasaan.hold --traj runs/hold/<clip>.npz ... --out runs/hold
+```
+
+The gates failed with a reference as the nominal. `hold` takes the nominal from a rollout a working tracker already
+produced (states and PD targets at 50 Hz), so feasibility is given and only the feedback is tested: linearize along
+the log, Riccati, roll out, push. It first checks that the file agrees with itself and that this simulator
+reproduces it, because a wrong quaternion order or velocity frame would look exactly like feedback failing.
+
+- If feedback holds walking and running logs: the feedback half is sound and the missing piece is how to get a
+  first feasible trajectory from a reference. `teach` now reports how the reference treats the points it leans on
+  (`hover_mm`, `slip_cm_s`, the joint that carries the gate 1 defect) to size that gap.
+- If it does not: Riccati feedback at 50 Hz through this contact model cannot hold stepping motion, and the
+  teacher is the wrong tool whatever the reference looks like.
+
+On logs this simulator made itself (a sway, the squat teacher's rollout, a robot toppling to the floor) it
+reproduces them to 1e-11 mm or better in the typical period and holds them; a float32 copy to 2e-5 mm. None of
+those is a stepping motion.
+
 ## Not yet run
 
-- The teacher on any real clip. Every teacher number above is from simulated or synthetic motion; this machine
-  cannot reach the dataset.
-- The full 40-clip Experiment 0 run, `dump_tracking.py` (needs JAX and a GPU) and `join`.
+- `aasaan.hold` on any log from the baseline; the script that writes those logs does not exist yet.
+- `dump_tracking.py` (needs JAX and a GPU) and `join`.
+- Nothing in this directory has been run on real motion from this machine, which cannot reach the dataset.
 - `test_model_matches_benchmark` was skipped here for lack of JAX.
 - The observation-only (LQG) teacher, distillation into the policy, and value-triggered correction do not exist yet.
