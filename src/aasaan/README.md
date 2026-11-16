@@ -4,9 +4,12 @@ Feedback-distilled trajectory optimization for humanoid motion tracking, built n
 measured on the benchmark's own G1, timestep and contact model. Work in progress; nothing in `src/nablamimic` is
 changed.
 
-**Status: the teacher does not work on real clips.** It holds every synthetic test in this file and produced no
-feasible trajectory on any of the five LAFAN1 clips it was run on ("Real clips" below). What is left to find out
-is which half failed, and `aasaan.hold` is the experiment for that.
+**Status: the method as designed is closed.** The teacher cannot be built from a real reference: it produced no
+feasible trajectory on any of five LAFAN1 clips. Its feedback does hold a rollout that is already feasible (five of
+five rollouts of the trained baseline), but only against pushes of 5 to 10 N s. So a first feasible trajectory has
+to come from a solver that copes with these references, the one that exists is the baseline's, and the baseline
+reaches 0.82 in 7.5 minutes. See "Real clips" below. One comparison is still open: whether the baseline policy
+itself withstands pushes any better than this feedback does.
 
 ## Experiment 0: does reference infeasibility predict tracking difficulty?
 
@@ -203,7 +206,7 @@ With 40 clips, -0.68 and -0.62 are not distinguishable. And the top of `r_cone` 
 clip for 20 s on end. The simulator's contact carries nothing in 54 to 92% of frames (median clip 89%). The largest
 infeasibility in these references is where the floor is, which the benchmark's reward is built to forgive.
 
-### What decides the next step: `aasaan.hold`
+### `aasaan.hold`: the feedback holds a feasible rollout
 
 ```bash
 python -m aasaan.hold --traj runs/hold/<clip>.npz ... --out runs/hold
@@ -214,19 +217,57 @@ produced (states and PD targets at 50 Hz), so feasibility is given and only the 
 the log, Riccati, roll out, push. It first checks that the file agrees with itself and that this simulator
 reproduces it, because a wrong quaternion order or velocity frame would look exactly like feedback failing.
 
-- If feedback holds walking and running logs: the feedback half is sound and the missing piece is how to get a
-  first feasible trajectory from a reference. `teach` now reports how the reference treats the points it leans on
-  (`hover_mm`, `slip_cm_s`, the joint that carries the gate 1 defect) to size that gap.
-- If it does not: Riccati feedback at 50 Hz through this contact model cannot hold stepping motion, and the
-  teacher is the wrong tool whatever the reference looks like.
+Run on the cluster with commit `70bac3a`: the baseline's final checkpoint rolled out in the benchmark's evaluator
+(MuJoCo Warp) on the same five windows, each with 5 to 16 lift-offs per foot and 2.7 to 5.8 m of travel.
 
-On logs this simulator made itself (a sway, the squat teacher's rollout, a robot toppling to the floor) it
-reproduces them to 1e-11 mm or better in the typical period and holds them; a float32 copy to 2e-5 mm. None of
-those is a stepping motion.
+| clip | this simulator vs the log, one period | targets alone last | feedback held | root error vs the log |
+|---|---|---|---|---|
+| walk1_subject1 | 7e-5 mm | 5.3 s | 8 s | 0.002 mm |
+| run1_subject2 | 3e-5 mm | 5.3 s | 8 s | 0.0003 mm |
+| jumps1_subject1 | 6e-5 mm | 3.7 s | 8 s | 46 mm (drifts from 1.8 s on; airborne a third of the window) |
+| dance1_subject1 | 7e-5 mm | 5.9 s | 8 s | 0.0008 mm |
+| fallAndGetUp3_subject1 | 6e-5 mm | 5.0 s | 8 s | 0.014 mm |
+
+Pushes in that run (one instant per clip, along world axes): 5 N s was recovered in 10 of 15 clip-directions,
+10 N s in 4 of 15, 20 and 40 N s never. No wider than on the synthetic squat.
+
+The same commit's gates, with the columns that describe the reference:
+
+| clip | points it leans on: height | their speed, median | gate 1 defect sits in |
+|---|---|---|---|
+| walk1_subject1 | 11.8 mm | 7 cm/s | left ankle pitch |
+| run1_subject2 | 12.5 mm | 9 cm/s | right ankle pitch |
+| jumps1_subject1 | 9.4 mm | 16 cm/s | right ankle pitch |
+| dance1_subject1 | 12.3 mm | 8 cm/s | right ankle pitch |
+| fallAndGetUp3_subject1 | 11.8 mm | 11 cm/s | left ankle pitch |
+
+A simulator trajectory has both at zero. The references rest on feet that float a centimetre up, tilted at the
+ankle and sliding. Loosening the root tolerance to the reward's 30 cm (`--tol root_pos=0.3`) did not produce a
+teacher either.
+
+### Where this leaves the method
+
+- **Riccati feedback at 50 Hz is not what failed.** Given a feasible stepping, running or get-up rollout it holds
+  it, through every contact change, to microns.
+- **The references are what failed, and local methods cannot start from them.** A tracker has to find its own
+  contacts under a reward that forgives centimetres; that is what the baseline's solver does and what linearizing
+  around the reference cannot.
+- **So solve-then-distill needs the baseline's solver to get its first trajectories**, and then has to beat the
+  baseline's own 7.5 minutes. On CPU the feedback alone costs 2.3 s per second of motion per pass: three passes
+  over the dataset's 8,800 s are 17 core-hours, 25 minutes on 40 cores, before any distillation.
+- **The tube is narrow.** 5 to 10 N s is a velocity change of 0.15 to 0.3 m/s for this robot.
+
+Still open: the same pushes on the baseline policy. `hold` now pushes along the robot's own heading at several
+instants, scores recovery against the unpushed rollout, and writes the exact pushes to `push_plan.json` so that
+another controller can be given the same ones. If the policy is no sturdier than the feedback, push tolerance is a
+gap in this family of trackers; if it is much sturdier, the feedback has nothing left to add.
+
+On logs this simulator made itself (a sway, the squat teacher's rollout, a robot toppling to the floor) `hold`
+reproduces them to 1e-11 mm or better in the typical period and holds them; a float32 copy to 2e-5 mm.
 
 ## Not yet run
 
-- `aasaan.hold` on any log from the baseline; the script that writes those logs does not exist yet.
+- The push comparison with the baseline policy (above).
 - `dump_tracking.py` (needs JAX and a GPU) and `join`.
 - Nothing in this directory has been run on real motion from this machine, which cannot reach the dataset.
 - `test_model_matches_benchmark` was skipped here for lack of JAX.

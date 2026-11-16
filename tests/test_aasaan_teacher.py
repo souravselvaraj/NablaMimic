@@ -4,6 +4,9 @@ Two references with known character: a trajectory the simulator produced (feasib
 never simulated (plausible, not feasible, soles flat only to a millimetre).
 """
 
+import csv
+import json
+
 import mujoco
 import numpy as np
 import pytest
@@ -13,7 +16,7 @@ from aasaan.feasibility import Analyzer, stance_quality
 from aasaan.model import SUBSTEPS, build_model, scene_path
 from aasaan.reference import Reference, kinematics, load_reference, to_csv_rows
 from aasaan.synthetic import squat
-from aasaan.teacher import (ControlPath, Setpoints, Simulator, control_states, feedforward, ilqr,
+from aasaan.teacher import (ControlPath, Setpoints, Simulator, control_states, feedforward, heading_pushes, ilqr,
                             one_period_defect, open_loop, rollout, seat)
 
 pytestmark = pytest.mark.skipif(not scene_path().exists(), reason="Menagerie G1 missing (scripts/setup_menagerie.sh)")
@@ -246,12 +249,29 @@ def test_hold_reads_a_log_and_catches_wrong_conventions(sim, tmp_path, capsys):
     for name, (q, v, u) in (("sway", _log(1.0)), ("late", (Q[:-1], V[:-1], U[1:]))):
         files.append(str(tmp_path / f"{name}.npz"))
         np.savez(files[-1], qpos=q.astype(np.float32), qvel=v.astype(np.float32), ctrl=u.astype(np.float32))
-    hold.main(["--traj", *files, "--out", str(tmp_path / "out"), "--impulses", "5", "--workers", "1"])
+    hold.main(["--traj", *files, "--out", str(tmp_path / "out"), "--impulses", "5", "--instants", "2",
+               "--workers", "1"])
     text = capsys.readouterr().out
     assert "WARNING late" in text and "WARNING sway" not in text
-    assert "sway: fwd:" in text and (tmp_path / "out" / "sway_teacher.npz").exists()
+    assert "recovered / still up / fell" in text and (tmp_path / "out" / "teachers" / "sway.npz").exists()
+    with open(tmp_path / "out" / "hold.csv") as f:
+        row = next(r for r in csv.DictReader(f) if r["clip"] == "sway")
+    assert sum(int(c) for c in row["push_5"].split("/")) == 6 and row["push_5_detail"].count("@") == 6
+    with open(tmp_path / "out" / "push_plan.json") as f:
+        plan = json.load(f)
+    assert plan["duration_steps"] == 5 and [m["step"] for m in plan["clips"]["sway"]] == [17, 33]
+    assert np.allclose(plan["clips"]["sway"][0]["side"], heading_pushes(_log(1.0)[0][17])["side"], atol=1e-4)
     with pytest.raises(ValueError, match="expected qpos"):
         hold.load(_bad_shape(tmp_path, Q, V, U), sim)
+
+
+def test_pushes_are_named_by_the_robots_heading():
+    """Facing +y (a quarter turn to the left), forward is +y and the robot's left is -x."""
+    q = np.zeros(36)
+    q[3], q[6] = np.cos(np.pi / 4), np.sin(np.pi / 4)
+    d = heading_pushes(q)
+    assert np.allclose(d["fwd"], [0, 1, 0], atol=1e-12) and np.allclose(d["side"], [-1, 0, 0], atol=1e-12)
+    assert np.allclose(d["back"], -d["fwd"])
 
 
 def _bad_shape(tmp_path, Q, V, U):

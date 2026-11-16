@@ -9,4 +9,4 @@ Implemented so far:
   hold    the same feedback around a logged feasible rollout instead of a reference (python -m aasaan.hold --help)
 """
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"

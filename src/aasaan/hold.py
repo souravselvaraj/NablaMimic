@@ -29,11 +29,20 @@ Reported per trajectory (CPU MuJoCo throughout):
   log_s        seconds the first of those lasted
   held_s       seconds held (all of it unless start is none)
   track_*      largest error of the held rollout against the logged trajectory
-  push_<I>     for an impulse of I N s on the torso over 0.1 s, a third of the way in, per direction:
-               R recovered (root back within 3 cm of the log at the end), S still up but further off, F fell
+  push_<I>     pushes of I N s: a constant force of I / 0.1 N on torso_link for 0.1 s (5 control steps), at
+               --instants evenly spaced moments of the window, forward, backward and to the left of the robot's
+               heading at that moment. Counted as recovered / still up / fell:
+                 recovered  root position within 3 cm of the unpushed rollout at the end of the window
+                 still up   further off than that, but inside the termination test
+                 fell       tripped the benchmark's termination test (height off by 0.25 m or tilt by 0.8)
+               push_<I>_detail lists each one, e.g. fwd@100:R.
+The exact pushes are written to <out>/push_plan.json (step, world-frame unit vectors per clip) so that the same
+pushes can be given to another controller, for example the policy that produced the logs. Teachers go to
+<out>/teachers/, not next to the logs.
 """
 
 import argparse
+import json
 import os
 import time
 from multiprocessing import Pool
@@ -43,11 +52,11 @@ import mujoco
 import numpy as np
 
 from .exp0 import _print_table, _write
-from .teacher import ControlPath, Setpoints, Simulator, ilqr, one_period_defect, open_loop, rollout
+from .teacher import ControlPath, Setpoints, Simulator, heading_pushes, ilqr, one_period_defect, open_loop, rollout
 
 _SIM = None
-DIRS = {"fwd": (1.0, 0.0, 0.0), "back": (-1.0, 0.0, 0.0), "side": (0.0, 1.0, 0.0)}
-RECOVERED = 0.03  # m
+RECOVERED = 0.03    # m
+PUSH_STEPS = 5      # control periods a push lasts: 0.1 s
 
 
 def load(path, sim):
@@ -82,8 +91,23 @@ def kinematic_check(sim, path, floors=(0.05, 0.1, 0.1)):
     return out
 
 
-def hold(sim, path, ff, passes=1, impulses=(), out=None, tol=None):
-    """One row of the report for a logged trajectory."""
+def push_plan(path, n, instants):
+    """[{step, fwd, back, side}] for `instants` evenly spaced moments of an n-step window; directions follow the
+    logged heading at each moment."""
+    steps = [int(round(n * (i + 1) / (instants + 1))) for i in range(instants)]
+    return [{"step": k, **{name: v.tolist() for name, v in heading_pushes(path.qpos[k]).items()}} for k in steps]
+
+
+def outcome(sim, unpushed, pushed):
+    """R, S or F for a pushed rollout against the unpushed one."""
+    if pushed.fell >= 0:
+        return "F"
+    off = sim.error(unpushed.q[-1], unpushed.v[-1], pushed.q[-1], pushed.v[-1])[:3]
+    return "R" if np.abs(off).max() < RECOVERED else "S"
+
+
+def hold(sim, path, ff, passes=1, impulses=(), instants=3, out=None, tol=None):
+    """(one row of the report, the push plan) for a logged trajectory."""
     t0 = time.time()
     n = len(ff.u)
     de = one_period_defect(sim, path, ff, k0=0)
@@ -102,33 +126,34 @@ def hold(sim, path, ff, passes=1, impulses=(), out=None, tol=None):
            "track_root_mm": float(cl.err[:, 0].max() * 1e3), "track_rot_mrad": float(cl.err[:, 1].max() * 1e3),
            "track_joint_mrad": float(cl.err[:, 2].max() * 1e3),
            "gain_max": float(np.abs(teacher.K).max())}
-    k_push = n // 3
+    plan = push_plan(path, n, instants)
     values = {}
     for imp in impulses:
         marks = []
-        for name, dirv in DIRS.items():
-            if not teacher.feasible:
-                marks.append(f"{name}:-")
-                continue
-            push = {k: np.array(dirv) * imp / 0.1 for k in range(k_push, k_push + 5)}
-            r = rollout(sim, path, teacher, push=push, ff=ff, tol=tol)
-            mark = "F" if r.fell >= 0 else ("R" if r.err[-1, 0] < RECOVERED else "S")
-            marks.append(f"{name}:{mark}")
-            values[f"value_{imp:g}_{name}"] = r.value
-        row[f"push_{imp:g}"] = " ".join(marks)
+        for moment in plan if teacher.feasible else []:
+            k = moment["step"]
+            for name in ("fwd", "back", "side"):
+                force = np.array(moment[name]) * imp / (PUSH_STEPS * 0.02)
+                r = rollout(sim, path, teacher, push={j: force for j in range(k, k + PUSH_STEPS)}, ff=ff, tol=tol)
+                marks.append(f"{name}@{k}:{outcome(sim, cl, r)}")
+                values[f"value_{imp:g}_{name}_{k}"] = r.value
+        got = [m[-1] for m in marks]
+        row[f"push_{imp:g}"] = "/".join(str(got.count(c)) for c in "RSF") if marks else "-"
+        row[f"push_{imp:g}_detail"] = " ".join(marks)
     if out is not None and teacher.feasible:
-        np.savez_compressed(Path(out) / f"{path.name}_teacher.npz", k0=teacher.k0, **values,
+        (Path(out) / "teachers").mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(Path(out) / "teachers" / f"{path.name}.npz", k0=teacher.k0, **values,
                             **{k: getattr(teacher, k).astype(np.float32) for k in ("q", "v", "u", "K", "P")})
     row["cpu_s"] = time.time() - t0
-    return row
+    return row, plan
 
 
 def _one(job):
     global _SIM
-    path, passes, impulses, out = job
+    path, passes, impulses, instants, out = job
     if _SIM is None:
         _SIM = Simulator()
-    return hold(_SIM, *load(path, _SIM), passes=passes, impulses=impulses, out=out)
+    return hold(_SIM, *load(path, _SIM), passes=passes, impulses=impulses, instants=instants, out=out)
 
 
 def main(argv=None):
@@ -137,18 +162,25 @@ def main(argv=None):
     ap.add_argument("--traj", nargs="+", required=True, help=".npz files with qpos, qvel, ctrl at 50 Hz")
     ap.add_argument("--passes", type=int, default=1, help="iLQR passes after the first trajectory")
     ap.add_argument("--impulses", type=float, nargs="+", default=[5.0, 10.0, 20.0, 40.0], help="push sizes (N s)")
+    ap.add_argument("--instants", type=int, default=3, help="moments of the window at which each push is tried")
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     args = ap.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    jobs = [(str(p), args.passes, args.impulses, str(out)) for p in args.traj]
+    jobs = [(str(p), args.passes, args.impulses, args.instants, str(out)) for p in args.traj]
     workers = max(1, min(args.workers, len(jobs)))
     if workers == 1:
-        rows = [_one(j) for j in jobs]
+        results = [_one(j) for j in jobs]
     else:
         with Pool(workers) as pool:
-            rows = pool.map(_one, jobs, chunksize=1)
+            results = pool.map(_one, jobs, chunksize=1)
+    rows = [r for r, _ in results]
+    with open(out / "push_plan.json", "w") as f:
+        json.dump({"body": "torso_link", "frame": "world", "duration_steps": PUSH_STEPS, "control_dt": 0.02,
+                   "force_N": "impulse / 0.1 * unit vector, constant over duration_steps starting at step",
+                   "impulses_Ns": args.impulses, "recovered_within_m": RECOVERED,
+                   "clips": {r["clip"]: plan for r, plan in results}}, f, indent=1)
     _write(out / "hold.csv", rows)
     _print_table(rows, ("clip", "seconds", "kin_lin", "kin_ang", "kin_joint", "engine_root_mm", "engine_joint_mrad",
                         "replay_s", "start", "log_s", "held_s", "track_root_mm", "track_joint_mrad"))
@@ -162,8 +194,9 @@ def main(argv=None):
             print(f"WARNING {r['clip']}: this simulator does not reproduce the log (one-period defect "
                   f"{r['engine_root_mm']:.3g} mm, {r['engine_joint_mrad']:.3g} mrad). If ctrl is the target the "
                   "simulator really received, the two simulators differ and the hold is a test of both at once.")
+    print("pushes, recovered / still up / fell:")
     for imp in args.impulses:
-        print(f"push {imp:g} N s: " + "; ".join(f"{r['clip']}: {r[f'push_{imp:g}']}" for r in rows))
+        print(f"  {imp:g} N s: " + "; ".join(f"{r['clip']} {r[f'push_{imp:g}']}" for r in rows))
 
 
 if __name__ == "__main__":

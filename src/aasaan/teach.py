@@ -20,7 +20,7 @@ CPU only. Per clip it takes a window of the smoothed reference and reports:
   held_s         seconds of the window the teacher's nominal covers (all of it when feasible)
   track_*        the nominal's largest error against the reference
   pushes         for each impulse (N s, applied to the torso over 0.1 s, a third of the way in): the directions
-                 (forward, backward, sideways) the teacher survived
+                 (forward, backward and to the left of the robot's heading) the teacher survived
 The teacher of each clip is saved to <out>/<clip>.npz (float32: q, v, u, K, P; k0 and the window in config.json).
 --refs keeps the smoothed references on disk; without it every run refits the whole clip (about an hour each).
 Linearization costs about 2.5 CPU-seconds per second of motion per pass: three passes by default, four when the
@@ -40,10 +40,9 @@ from .exp0 import _clips, _eps, _print_table, _write
 from .feasibility import Analyzer, stance_quality
 from .model import SUBSTEPS
 from .reference import EPS_DEFAULT, Reference, load_reference
-from .teacher import TOL, Simulator, feedforward, ilqr, one_period_defect, open_loop, rollout, seat
+from .teacher import TOL, Simulator, feedforward, heading_pushes, ilqr, one_period_defect, open_loop, rollout, seat
 
 _CTX = None
-DIRS = {"fwd": (1.0, 0.0, 0.0), "back": (-1.0, 0.0, 0.0), "side": (0.0, 1.0, 0.0)}
 
 
 def window(ref, start, seconds):
@@ -91,8 +90,8 @@ def _one(job):
     for imp in impulses:
         ok = []
         if teacher.feasible:
-            for name, dirv in DIRS.items():
-                push = {k: np.array(dirv) * imp / 0.1 for k in range(k_push, k_push + 5)}
+            for name, dirv in heading_pushes(teacher.q[k_push - teacher.k0]).items():
+                push = {k: dirv * imp / 0.1 for k in range(k_push, k_push + 5)}
                 if rollout(sim, ref, teacher, push=push, ff=ff, tol=tol).fell < 0:
                     ok.append(name)
         row[f"push_{imp:g}"] = "+".join(ok) or "none"

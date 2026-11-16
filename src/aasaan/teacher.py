@@ -217,6 +217,15 @@ def weights(nv, nu, tol=None):
     return np.diag(1.0 / qd ** 2), np.eye(nu) / t["setpoint"] ** 2
 
 
+def heading_pushes(q):
+    """Unit vectors in the world's horizontal plane, named by the robot's own heading (the yaw of its root):
+    fwd, back, and side (to its left)."""
+    w, x, y, z = q[3:7]
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    f, left = np.array([np.cos(yaw), np.sin(yaw), 0.0]), np.array([-np.sin(yaw), np.cos(yaw), 0.0])
+    return {"fwd": f, "back": -f, "side": left}
+
+
 def _gravity_z(q):
     """z component of gravity's direction in the root frame (-1 upright), from the root quaternion (w, x, y, z)."""
     _, x, y, _ = q[3:7]
